@@ -2,7 +2,8 @@ name: Build Win7 llama.cpp v1.0.0 (W-2245 + RTX A4000 sm_86)
 
 # 线路D：v1.0.0 引擎，运行机 = Xeon W-2245 (Cascade Lake, AVX2) + RTX A4000 (Ampere sm_86, 16GB)
 # 与线路C(E5640/P2200) 的差异：
-#   - CUDA 架构 61 -> 86（A4000 sm_86；CUDA 11.4.3 上限正好 sm_86）
+#   - CUDA 架构 61 -> 86（A4000 sm_86）；CUDA 11.4.3 -> 11.8.0
+#     （mmq-few.cu 的 sm_80+ 分支在 nvcc 11.4 下 constexpr 编译失败，11.8 修复）
 #   - CPU 基线 SSE4.2 -> AVX2（w2245-cache.cmake；W-2245 双 FMA）
 #   - artifact 名带 a4000，避免与线路C混淆
 # 其它不变：Win7 兼容补丁、Ninja CUDA、--parallel 2、UI 关闭、门禁、SHA2 签名前置在实机侧。
@@ -53,27 +54,31 @@ jobs:
           }
           ninja --version
 
-      # CUDA 11.4.3：A4000 sm_86 原生支持（compute_86），无需更高版本。
-      - name: Install CUDA 11.4.3 (CUDA job only)
+      # CUDA 11.8.0：sm_86 原生支持（compute_86）。
+      # 注意：不能用 11.4.x —— mmq-few.cu 的 sm_80+ 分支（cp.async）在 nvcc 11.4 +
+      # MSVC 下报 "expression must have a constant value"（constexpr 求值 bug），
+      # 11.8 的 nvcc 修复了该 C++17 constexpr 问题。产物 DLL 仍是 cudart64_110
+      # （CUDA 11.x 全系同名），Win7 + R470 驱动照常兼容。
+      - name: Install CUDA 11.8.0 (CUDA job only)
         if: matrix.variant == 'cuda'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $url = "https://developer.download.nvidia.com/compute/cuda/11.4.3/network_installers/cuda_11.4.3_win10_network.exe"
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\cuda1143.exe" -UseBasicParsing
-          $p = Start-Process -FilePath "$env:RUNNER_TEMP\cuda1143.exe" `
-               -ArgumentList '-s','nvcc_11.4','cudart_11.4','cublas_11.4','cublas_dev_11.4','visual_studio_integration_11.4' `
+          $url = "https://developer.download.nvidia.com/compute/cuda/11.8.0/network_installers/cuda_11.8.0_windows_network.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\cuda1180.exe" -UseBasicParsing
+          $p = Start-Process -FilePath "$env:RUNNER_TEMP\cuda1180.exe" `
+               -ArgumentList '-s','nvcc_11.8','cudart_11.8','cublas_11.8','cublas_dev_11.8','visual_studio_integration_11.8' `
                -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "CUDA 11.4.3 install failed, exit=$($p.ExitCode)" }
-          $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4\bin"
+          if ($p.ExitCode -ne 0) { throw "CUDA 11.8.0 install failed, exit=$($p.ExitCode)" }
+          $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin"
           "$cudaBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           & "$cudaBin\nvcc.exe" -V
 
           # 网络安装器常漏装 CUDA 的 VS 集成文件 -> CMake 报 "No CUDA toolset found"。
           # 本 job 用 Ninja 绕开 MSBuild 集成，但复制过去也无害，作为兜底。
           Write-Host "=== CUDA VS integration fix (belt and braces) ==="
-          $vsIntSrc = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4\extras\visual_studio_integration\MSBuildExtensions"
+          $vsIntSrc = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\extras\visual_studio_integration\MSBuildExtensions"
           $vsIntDst = "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\MSBuild\Microsoft\VC\v160\BuildCustomizations"
           if (Test-Path $vsIntSrc) {
             New-Item -ItemType Directory -Force -Path $vsIntDst | Out-Null
@@ -136,14 +141,17 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4\bin"
+          $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin"
           $env:PATH = "$cudaBin;$env:PATH"
-          # A4000 = sm_86 / compute 8.6。CUDA 11.4.3 的 nvcc 最高支持 sm_86，正好匹配。
+          # A4000 = sm_86 / compute 8.6。
+          # -DCMAKE_BUILD_TYPE=Release 必须显式给：Ninja 单配置下不设会落 Debug
+          # （/Od /RTC1），既拖慢数倍又触发 MSVC constexpr 报错。
           cmake -S llama.cpp-1.0.0 -B build-cuda -C w2245-cache.cmake -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe `
             -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 `
             -DCMAKE_CUDA_COMPILER="$cudaBin\nvcc.exe" `
-            -DCUDAToolkit_ROOT="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4" `
+            -DCUDAToolkit_ROOT="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8" `
             -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP_ENABLED=OFF `
             -DLLAMA_OPENSSL=OFF -DLLAMA_CURL=OFF `
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF `
@@ -155,7 +163,8 @@ jobs:
           foreach ($need in @("GGML_NATIVE:BOOL=OFF","GGML_AVX2:BOOL=ON","GGML_FMA:BOOL=ON","GGML_BMI2:BOOL=ON","GGML_AVX512:BOOL=OFF","GGML_AVX512_VNNI:BOOL=OFF")) {
             if (-not $cache.Contains($need)) { throw "CUDA SIMD baseline NOT applied: missing '$need'." }
           }
-          Write-Host "CUDA SIMD baseline OK: AVX2 + FMA + BMI2, AVX512 off (W-2245-safe)."
+          if (-not $cache.Contains("CMAKE_BUILD_TYPE:STRING=Release")) { throw "CUDA build type is not Release - would ship a slow Debug binary." }
+          Write-Host "CUDA SIMD baseline OK: AVX2 + FMA + BMI2, AVX512 off (W-2245-safe). CUDA build type: Release."
           # 免费 runner 7GB RAM，fattn 量化模板 --parallel 8 会 OOM；降到 2 稳。
           Write-Host "=== Free RAM (MB) before CUDA build ==="
           (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory
@@ -183,7 +192,7 @@ jobs:
           Copy-Item "$src\llama-server.exe" deploy\
           Copy-Item "$src\llama-cli.exe" deploy\
           if ('${{ matrix.variant }}' -eq 'cuda') {
-            $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4\bin"
+            $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin"
             foreach ($dll in @('cudart64_110.dll','cublas64_11.dll','cublasLt64_11.dll')) {
               if (Test-Path "$cudaBin\$dll") { Copy-Item "$cudaBin\$dll" deploy\ }
               else { Write-Warning "Missing CUDA DLL: $dll" }
