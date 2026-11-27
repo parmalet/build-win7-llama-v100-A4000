@@ -66,14 +66,25 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $url = "https://developer.download.nvidia.com/compute/cuda/11.8.0/network_installers/cuda_11.8.0_windows_network.exe"
           Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\cuda1180.exe" -UseBasicParsing
+          # thrust_11.8 必装：CUDA 11.0+ 的 CUB 头文件(include\cub\cub.cuh)随 thrust 组件分发。
+          # llama.cpp v1.0.0 在 CUDART>=11.7 时自动 define GGML_CUDA_USE_CUB，
+          # argsort.cu/cumsum.cu 会 #include <cub/cub.cuh>；漏装 thrust 会报 C1083。
+          # 线路C(CUDA 11.4)因 CUDART=11040<11070 不触发 CUB 路径，故从未暴露。
           $p = Start-Process -FilePath "$env:RUNNER_TEMP\cuda1180.exe" `
-               -ArgumentList '-s','nvcc_11.8','cudart_11.8','cublas_11.8','cublas_dev_11.8','visual_studio_integration_11.8' `
+               -ArgumentList '-s','nvcc_11.8','cudart_11.8','thrust_11.8','cublas_11.8','cublas_dev_11.8','visual_studio_integration_11.8' `
                -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "CUDA 11.8.0 install failed, exit=$($p.ExitCode)" }
           $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin"
           "$cudaBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           & "$cudaBin\nvcc.exe" -V
+
+          # 前置校验：CUB 头文件缺失时立即失败，避免编译到一半才报 C1083。
+          $cubHeader = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\include\cub\cub.cuh"
+          if (-not (Test-Path $cubHeader)) {
+            throw "CUDA CUB header missing: $cubHeader. thrust_11.8 component was not installed correctly."
+          }
+          Write-Host "CUDA CUB header present: $cubHeader"
 
           # 网络安装器常漏装 CUDA 的 VS 集成文件 -> CMake 报 "No CUDA toolset found"。
           # 本 job 用 Ninja 绕开 MSBuild 集成，但复制过去也无害，作为兜底。
