@@ -1,1 +1,202 @@
+name: Build Win7 llama.cpp v1.0.0 (W-2245 + RTX A4000 sm_86)
 
+# 线路D：v1.0.0 引擎，运行机 = Xeon W-2245 (Cascade Lake, AVX2) + RTX A4000 (Ampere sm_86, 16GB)
+# 与线路C(E5640/P2200) 的差异：
+#   - CUDA 架构 61 -> 86（A4000 sm_86；CUDA 11.4.3 上限正好 sm_86）
+#   - CPU 基线 SSE4.2 -> AVX2（w2245-cache.cmake；W-2245 双 FMA）
+#   - artifact 名带 a4000，避免与线路C混淆
+# 其它不变：Win7 兼容补丁、Ninja CUDA、--parallel 2、UI 关闭、门禁、SHA2 签名前置在实机侧。
+# 免费构建机：GitHub Actions windows-2022 runner
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, cuda]   # cpu = 纯CPU保底；cuda = A4000 sm_86 GPU版
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+
+      - name: Install VS2019 BuildTools (v142 C++ workload)
+        shell: pwsh
+        run: |
+          choco install visualstudio2019buildtools `
+            --package-parameters "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive --norestart" `
+            -y --no-progress --limit-output
+          Write-Host "VS2019 BuildTools installed."
+
+      - name: Setup VS2019 x64 developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          vsversion: '2019'
+          arch: x64
+
+      - name: Show CMake version
+        shell: pwsh
+        run: cmake --version
+
+      - name: Ensure Ninja (CUDA job only)
+        if: matrix.variant == 'cuda'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress --limit-output
+          }
+          ninja --version
+
+      # CUDA 11.4.3：A4000 sm_86 原生支持（compute_86），无需更高版本。
+      - name: Install CUDA 11.4.3 (CUDA job only)
+        if: matrix.variant == 'cuda'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "https://developer.download.nvidia.com/compute/cuda/11.4.3/network_installers/cuda_11.4.3_win10_network.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\cuda1143.exe" -UseBasicParsing
+          $p = Start-Process -FilePath "$env:RUNNER_TEMP\cuda1143.exe" `
+               -ArgumentList '-s','nvcc_11.4','cudart_11.4','cublas_11.4','cublas_dev_11.4','visual_studio_integration_11.4' `
+               -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "CUDA 11.4.3 install failed, exit=$($p.ExitCode)" }
+          $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4\bin"
+          "$cudaBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & "$cudaBin\nvcc.exe" -V
+
+          # 网络安装器常漏装 CUDA 的 VS 集成文件 -> CMake 报 "No CUDA toolset found"。
+          # 本 job 用 Ninja 绕开 MSBuild 集成，但复制过去也无害，作为兜底。
+          Write-Host "=== CUDA VS integration fix (belt and braces) ==="
+          $vsIntSrc = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4\extras\visual_studio_integration\MSBuildExtensions"
+          $vsIntDst = "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\MSBuild\Microsoft\VC\v160\BuildCustomizations"
+          if (Test-Path $vsIntSrc) {
+            New-Item -ItemType Directory -Force -Path $vsIntDst | Out-Null
+            Copy-Item "$vsIntSrc\*.props","$vsIntSrc\*.targets","$vsIntSrc\*.xml" $vsIntDst -Force -ErrorAction SilentlyContinue
+            Get-ChildItem $vsIntDst -Filter "CUDA*" | Select-Object -ExpandProperty Name
+          } else {
+            Write-Warning "VS integration source not found: $vsIntSrc"
+          }
+
+      - name: Clone llama.cpp v1.0.0
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch v1.0.0 https://github.com/ggml-org/llama.cpp.git llama.cpp-1.0.0
+          if ($LASTEXITCODE -ne 0) { throw "git clone llama.cpp v1.0.0 failed" }
+
+      - name: Apply Win7 compat patch (v1.0.0, with self-check)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git -C llama.cpp-1.0.0 apply --check ..\win7-compat-v100.patch
+          if ($LASTEXITCODE -ne 0) {
+            throw "PATCH CHECK FAILED: win7-compat-v100.patch does not apply to v1.0.0."
+          }
+          git -C llama.cpp-1.0.0 apply ..\win7-compat-v100.patch
+          # -SimpleMatch 必须加：括号在正则里是捕获组，会误报补丁失败。
+          $c = Select-String -Path "llama.cpp-1.0.0\vendor\cpp-httplib\httplib.cpp" -Pattern "Win7 compat" -SimpleMatch -Quiet
+          $h = Select-String -Path "llama.cpp-1.0.0\vendor\cpp-httplib\httplib.h" -Pattern "#if 0 && defined(_WIN32_WINNT)" -SimpleMatch -Quiet
+          if (-not ($c -and $h)) {
+            Write-Host "DIAG cpp-marker=$c h-marker=$h"
+            throw "Win7 patch markers not found after apply."
+          }
+          Write-Host "Win7 v1.0.0 patch applied and verified."
+
+      # ---------- CPU: AVX2 基线 ----------
+      - name: Configure & build (CPU, AVX2 baseline)
+        if: matrix.variant == 'cpu'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S llama.cpp-1.0.0 -B build-cpu -C w2245-cache.cmake -G "Visual Studio 16 2019" -A x64 `
+            -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP_ENABLED=OFF `
+            -DLLAMA_OPENSSL=OFF -DLLAMA_CURL=OFF `
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure (cpu) failed" }
+          # 校验 AVX2 基线生效、AVX512 全关（W-2245 无 VNNI/BF16，误开会 0xc000001d）
+          $cache = Get-Content build-cpu\CMakeCache.txt -Raw
+          foreach ($need in @("GGML_NATIVE:BOOL=OFF","GGML_AVX2:BOOL=ON","GGML_FMA:BOOL=ON","GGML_BMI2:BOOL=ON","GGML_AVX512:BOOL=OFF","GGML_AVX512_VNNI:BOOL=OFF")) {
+            if (-not $cache.Contains($need)) { throw "CPU SIMD baseline NOT applied: missing '$need'." }
+          }
+          Write-Host "CPU SIMD baseline OK: AVX2 + FMA + BMI2, AVX512 off (W-2245-safe)."
+          cmake --build build-cpu --config Release --parallel 8 --target llama-server llama-cli
+          if ($LASTEXITCODE -ne 0) { throw "cmake build (cpu) failed" }
+
+      # ---------- CUDA: sm_86，CPU 侧同样锁 AVX2 ----------
+      - name: Configure & build (CUDA, sm_86 for A4000, Ninja)
+        if: matrix.variant == 'cuda'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4\bin"
+          $env:PATH = "$cudaBin;$env:PATH"
+          # A4000 = sm_86 / compute 8.6。CUDA 11.4.3 的 nvcc 最高支持 sm_86，正好匹配。
+          cmake -S llama.cpp-1.0.0 -B build-cuda -C w2245-cache.cmake -G Ninja `
+            -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe `
+            -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 `
+            -DCMAKE_CUDA_COMPILER="$cudaBin\nvcc.exe" `
+            -DCUDAToolkit_ROOT="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4" `
+            -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP_ENABLED=OFF `
+            -DLLAMA_OPENSSL=OFF -DLLAMA_CURL=OFF `
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure (cuda) failed" }
+          $cache = Get-Content build-cuda\CMakeCache.txt -Raw
+          foreach ($need in @("GGML_NATIVE:BOOL=OFF","GGML_AVX2:BOOL=ON","GGML_FMA:BOOL=ON","GGML_BMI2:BOOL=ON","GGML_AVX512:BOOL=OFF","GGML_AVX512_VNNI:BOOL=OFF")) {
+            if (-not $cache.Contains($need)) { throw "CUDA SIMD baseline NOT applied: missing '$need'." }
+          }
+          Write-Host "CUDA SIMD baseline OK: AVX2 + FMA + BMI2, AVX512 off (W-2245-safe)."
+          # 免费 runner 7GB RAM，fattn 量化模板 --parallel 8 会 OOM；降到 2 稳。
+          Write-Host "=== Free RAM (MB) before CUDA build ==="
+          (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory
+          cmake --build build-cuda --parallel 2 --target llama-server llama-cli
+          if ($LASTEXITCODE -ne 0) { throw "cmake build (cuda) failed" }
+
+      # ---------- 门禁 ----------
+      - name: Win7 compatibility gate (import-audit.ps1)
+        shell: pwsh
+        id: audit
+        continue-on-error: true
+        run: |
+          $exe = if ('${{ matrix.variant }}' -eq 'cuda') { 'build-cuda\bin\llama-server.exe' } else { 'build-cpu\bin\Release\llama-server.exe' }
+          if (-not (Test-Path $exe)) { throw "exe not found for audit: $exe" }
+          . .\import-audit.ps1 -Path $exe
+
+      # ---------- 打包 ----------
+      - name: Stage deployables
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = if ('${{ matrix.variant }}' -eq 'cuda') { 'build-cuda\bin' } else { 'build-cpu\bin\Release' }
+          if (-not (Test-Path "$src\llama-server.exe")) { throw "llama-server.exe not found at $src" }
+          New-Item -ItemType Directory -Force -Path deploy | Out-Null
+          Copy-Item "$src\llama-server.exe" deploy\
+          Copy-Item "$src\llama-cli.exe" deploy\
+          if ('${{ matrix.variant }}' -eq 'cuda') {
+            $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4\bin"
+            foreach ($dll in @('cudart64_110.dll','cublas64_11.dll','cublasLt64_11.dll')) {
+              if (Test-Path "$cudaBin\$dll") { Copy-Item "$cudaBin\$dll" deploy\ }
+              else { Write-Warning "Missing CUDA DLL: $dll" }
+            }
+          }
+          $audit = if ('${{ steps.audit.outcome }}' -eq 'success') { 'PASS' } else { 'AUDIT_FAIL' }
+          "audit=$audit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Get-ChildItem deploy | Format-Table Name,Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-a4000-win7-${{ matrix.variant }}-${{ env.audit }}
+          path: deploy\*
+          if-no-files-found: error
+          retention-days: 90
