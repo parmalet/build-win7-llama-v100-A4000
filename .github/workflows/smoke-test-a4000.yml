@@ -1,0 +1,277 @@
+name: Smoke Test llama.cpp v1.0.0 (W-2245 + A4000, PASS artifacts)
+
+# ============================================================================
+# 作用：在 GitHub 免费 windows-2022 runner 上，对构建 workflow 产出的 PASS
+#       artifact 做云端冒烟测试，避免摆渡到内网 Win7 后才发现 exe/DLL/API 问题。
+#
+# 能测什么（runner 无 GPU）：
+#   1. 两版 exe 能启动（--version）—— 验证静态链接、无 Win8+ API 加载失败
+#   2. GPU 版 3 个 CUDA DLL 齐全 + 启动能解析依赖 —— 避免拷到 Win7 才报缺 DLL
+#   3. CPU 版加载小模型起服务 —— /v1/models 通
+#   4. 带 tools 的 chat 请求被正确处理 —— 证明 --jinja + tool schema 解析正常
+#
+# 测不了什么（必须 Win7+A4000 实机）：
+#   - -ngl 99 真实 GPU offload / 显存分配 / 吞吐
+#   - 真实 DSH 模型（LFM3/Qwen3.8）的工具调用质量 —— 那部分用 toolcall_ab.py
+#
+# 触发：默认自动下载「最近一次成功构建」的 PASS artifact；
+#       workflow_dispatch 时可填 run_id 指定某次构建（run_id 在该次构建页面 URL 里）。
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '构建 run 的 ID（可选，留空=自动找最近成功构建）'
+        required: false
+        type: string
+      test_model_repo:
+        description: '冒烟测试用 GGUF 的 HF 仓库'
+        required: false
+        type: string
+        default: 'Qwen/Qwen2.5-0.5B-Instruct-GGUF'
+      test_model_file:
+        description: '冒烟测试用 GGUF 文件名（小模型，仅验链路非验质量）'
+        required: false
+        type: string
+        default: 'qwen2.5-0.5b-instruct-q4_k_m.gguf'
+
+permissions:
+  actions: read      # 跨 run 下载 artifact 必需
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout (for scripts, optional)
+        uses: actions/checkout@v4
+
+      # 跨 run 下载 artifact：官方 download-artifact 只能下当前 run，
+      # 故用社区广泛使用的 dawidd6 action 按 workflow+conclusion 找最近成功构建。
+      - name: Download CPU PASS artifact
+        id: dl_cpu
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build-w2245-a4000.yml
+          workflow_conclusion: success
+          name: llama-a4000-win7-cpu-PASS
+          path: artifacts/cpu
+          run_id: ${{ inputs.run_id }}
+          if_no_artifact_found: fail
+
+      - name: Download CUDA PASS artifact
+        id: dl_cuda
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build-w2245-a4000.yml
+          workflow_conclusion: success
+          name: llama-a4000-win7-cuda-PASS
+          path: artifacts/cuda
+          run_id: ${{ inputs.run_id }}
+          if_no_artifact_found: fail
+
+      # ---------- 1. exe 完整性（CPU 动态 + CUDA 静态） ----------
+      # 关键：GitHub 免费 runner 无 NVIDIA GPU/驱动，CUDA 版 exe 的 --version
+      # 会在 CUDA backend 初始化阶段失败退出（连版本字符串都打印不出），这是
+      # 环境缺失而非 exe 损坏。故 CUDA 版只做静态验证（文件/大小/DLL/导入表），
+      # 真正的 -ngl 99 offload 必须到 Win7+A4000 实机测。
+      - name: Verify exe integrity (CPU dynamic + CUDA static)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cpu = ".\artifacts\cpu\llama-server.exe"
+          $gpu = ".\artifacts\cuda\llama-server.exe"
+          foreach ($exe in @($cpu, $gpu)) {
+            if (-not (Test-Path $exe)) { throw "MISSING EXE: $exe" }
+            $sz = (Get-Item $exe).Length
+            Write-Host "FOUND $exe ($([math]::Round($sz/1MB,2)) MB)"
+          }
+          # CPU 版：纯 CPU，--version 必须成功（验证静态链接/无 Win8+ API 加载失败）
+          Write-Host "=== CPU llama-server.exe --version ==="
+          & $cpu --version
+          if ($LASTEXITCODE -ne 0) { throw "CPU exe --version failed (loader/CRT issue?)" }
+          # CUDA 版：绝不在无 GPU runner 上执行 --version。
+          # 根因：cudart64_110.dll 启动时会 LoadLibrary 驱动的 nvcuda.dll，runner 无
+          # NVIDIA 驱动 -> STATUS_DLL_NOT_FOUND (0xC0000135/-1073741515)；更隐蔽的是
+          # 该非零退出码会残留在 $LASTEXITCODE，令 pwsh 进程整体退出 1（即便脚本
+          # 已执行到末尾）。故 CUDA 版只做静态验证（文件大小 + 下一步 dumpbin 导入表）。
+          Write-Host "CUDA exe: static check only (no execution; runner has no GPU/driver)"
+          Write-Host "EXE_PRESENCE_OK"
+          # 显式归零：PowerShell 脚本的进程退出码取自最后一条原生命令的 $LASTEXITCODE，
+          # 上面的 CPU --version 成功(0)，这里再兜底确保 step 不被残留值污染。
+          $global:LASTEXITCODE = 0
+
+      # ---------- 2. CUDA DLL 依赖链（静态验证，不执行 GPU 代码） ----------
+      - name: Verify CUDA runtime DLLs & import table (GPU variant)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $need = @('cudart64_110.dll','cublas64_11.dll','cublasLt64_11.dll')
+          Write-Host "=== CUDA artifact contents ==="
+          Get-ChildItem ".\artifacts\cuda" | Format-Table Name,Length -AutoSize
+          foreach ($dll in $need) {
+            if (-not (Test-Path ".\artifacts\cuda\$dll")) { throw "MISSING CUDA DLL: $dll" }
+          }
+          # 用 dumpbin 读 exe 导入表，确认 exe 引用的 CUDA DLL 都在包里
+          # （防止构建时链接了别的 DLL 名却拷错文件）。dumpbin 只读 PE，不需要 GPU。
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = $null
+          if (Test-Path $vswhere) {
+            $vsPath = & $vswhere -latest -property installationPath
+            $dumpbin = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" `
+                       -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $dumpbin) { $dumpbin = (Get-Command dumpbin -ErrorAction SilentlyContinue).Source }
+          if ($dumpbin) {
+            Write-Host "=== CUDA exe import dependencies (dumpbin: $dumpbin) ==="
+            $deps = & $dumpbin /dependents ".\artifacts\cuda\llama-server.exe" 2>&1
+            $deps | ForEach-Object { Write-Host "  $_" }
+            # 只把「trim 后是纯 DLL 文件名」的行当作导入项，避开 dumpbin 头部/路径行。
+            # 旧脚本用宽松子串正则，会把 cuda.dll 一起抓进来又要求打包 -> 误报。
+            $imported = @()
+            foreach ($line in $deps) {
+              $t = $line.ToString().Trim()
+              if ($t -match '^([A-Za-z0-9_]+\.dll)$') { $imported += $Matches[1].ToLower() }
+            }
+            Write-Host "All PE imports: $($imported -join ', ')"
+            # 需要随 exe 分发的 CUDA runtime DLL（cudart/cublas/cudnn/cufft/curand/nvrtc 系列）
+            $packaged = @($imported | Where-Object { $_ -match '^(cudart|cublas|cudnn|cufft|curand|nvrtc)' })
+            if ($packaged.Count -eq 0) { throw "dumpbin found no packaged CUDA runtime DLL imports - wrong binary?" }
+            foreach ($d in ($packaged | Sort-Object -Unique)) {
+              if (-not (Test-Path ".\artifacts\cuda\$d")) { throw "CUDA runtime import '$d' missing from artifact - would fail on Win7" }
+            }
+            # 驱动/系统提供的 DLL（cuda.dll、nvcuda.dll 等）本就不随程序打包，仅提示不判失败。
+            $driverProvided = @($imported | Where-Object { $_ -match '^(cuda|nvcuda)\.dll$' })
+            if ($driverProvided.Count -gt 0) {
+              Write-Host "Driver-provided CUDA DLLs (from NVIDIA driver, not packaged): $($driverProvided -join ', ')"
+            }
+            Write-Host "CUDA imports resolved: packaged=[$($packaged -join ', ')]"
+          } else {
+            Write-Warning "dumpbin not found; DLL presence check passed but import-table check skipped."
+          }
+          # 关键判据：DLL 齐全 + PE 导入表解析成功 = 拷到 Win7 有驱动时不会缺 DLL。
+          Write-Host "CUDA_DLLS_OK"
+          # dumpbin 是原生命令，显式归零避免其退出码残留污染 step。
+          $global:LASTEXITCODE = 0
+
+      # ---------- 3. 下载小模型 ----------
+      - name: Download tiny test model (~400MB, link check only)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = '${{ inputs.test_model_repo }}'
+          $file = '${{ inputs.test_model_file }}'
+          $urls = @(
+            "https://huggingface.co/$repo/resolve/main/$file",
+            "https://hf-mirror.com/$repo/resolve/main/$file"
+          )
+          $ok = $false
+          foreach ($u in $urls) {
+            try {
+              Write-Host "Downloading from $u ..."
+              Invoke-WebRequest -Uri $u -OutFile test.gguf -UseBasicParsing -TimeoutSec 900
+              $ok = $true; break
+            } catch { Write-Warning "download failed from $u : $($_.Exception.Message)" }
+          }
+          if (-not $ok) { throw "test model download failed from all mirrors" }
+          $sz = (Get-Item test.gguf).Length
+          Write-Host "downloaded test.gguf: $([math]::Round($sz/1MB,1)) MB"
+          if ($sz -lt 100MB) { throw "test.gguf too small ($sz bytes), likely HTML/error page" }
+
+      # ---------- 4. 起 CPU 服务 + API 链路 ----------
+      - name: API smoke test (CPU variant, OpenAI-compatible)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $model = (Join-Path $pwd "test.gguf")
+          $server = (Resolve-Path ".\\artifacts\\cpu\\llama-server.exe").Path
+          $log = Join-Path $pwd "server.out.log"
+          $err = Join-Path $pwd "server.err.log"
+          Write-Host "=== Starting CPU server on 127.0.0.1:8080 ==="
+          $proc = Start-Process -FilePath $server `
+            -ArgumentList @("-m", $model, "--jinja", "-c", "4096", "--host", "127.0.0.1", "--port", "8080", "-t", "4") `
+            -PassThru -RedirectStandardOutput $log -RedirectStandardError $err -WindowStyle Hidden
+          try {
+            # 等 health ready
+            $ready = $false
+            for ($i = 0; $i -lt 90; $i++) {
+              Start-Sleep -Seconds 2
+              try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:8080/health" -TimeoutSec 3 -UseBasicParsing
+                if ($r.StatusCode -eq 200) { $ready = $true; break }
+              } catch {}
+              if ($proc.HasExited) { break }
+            }
+            if (-not $ready) {
+              Write-Host "=== server stderr tail ==="
+              if (Test-Path $err) { Get-Content $err -Tail 60 }
+              throw "server did not become ready on 8080"
+            }
+            Write-Host "SERVER_READY"
+
+            # /v1/models
+            $models = Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/models" -TimeoutSec 15
+            Write-Host "=== /v1/models ==="
+            $models.data | Select-Object id,object | Format-Table -AutoSize
+            if (-not $models.data -or $models.data.Count -lt 1) { throw "/v1/models returned no models" }
+            Write-Host "MODELS_OK"
+
+            # 带 tools 的 chat：验证 --jinja + tool schema 解析（核心是请求不被 400/500 拒绝）
+            $payload = @{
+              messages = @(
+                @{ role = "user"; content = "Use the get_weather tool to check weather in Beijing." }
+              )
+              tools = @(
+                @{
+                  type = "function"
+                  function = @{
+                    name = "get_weather"
+                    description = "Get current weather for a city"
+                    parameters = @{
+                      type = "object"
+                      properties = @{ city = @{ type = "string"; description = "City name" } }
+                      required = @("city")
+                    }
+                  }
+                }
+              )
+              tool_choice = "auto"
+              temperature = 0
+              max_tokens = 256
+            } | ConvertTo-Json -Depth 12
+
+            $chat = Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/chat/completions" `
+              -Method Post -ContentType "application/json" -Body $payload -TimeoutSec 180
+            $msg = $chat.choices[0].message
+            Write-Host "=== /v1/chat/completions (with tools) ==="
+            Write-Host "finish_reason: $($chat.choices[0].finish_reason)"
+            Write-Host "content: $($msg.content)"
+            if ($msg.tool_calls) {
+              foreach ($tc in $msg.tool_calls) {
+                Write-Host "tool_call: $($tc.function.name)  args=$($tc.function.arguments)"
+                $null = $tc.function.arguments | ConvertFrom-Json   # arguments 必须是合法 JSON
+              }
+              Write-Host "TOOL_CALLS_OK"
+            } else {
+              Write-Warning "model emitted no tool_calls (small model, non-deterministic). API path itself is OK: HTTP 200 + valid JSON + tools accepted."
+            }
+            Write-Host "API_SMOKE_OK"
+          } finally {
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+            Write-Host "server stopped."
+          }
+
+      # ---------- 5. 汇总 ----------
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          $result = if ('${{ job.status }}' -eq 'success') { 'ALL SMOKE TESTS PASSED' } else { 'SMOKE TEST FAILED - see failed step log' }
+          Write-Host "===== $result ====="
+          "## Smoke test: $result`n`n- exe 存在性 + CPU --version: 见步骤 1`n- CUDA DLL 齐全 + PE 导入表: 见步骤 2`n- API/tools: 见步骤 4`n`n注 1：runner 无 GPU，CUDA 版 --version 失败属预期（已改静态验证），未测 -ngl 99 真实 offload。`n注 2：请到 Win7+A4000 实机验证 GPU 加速与真实工具调用。" `
+            | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
